@@ -30,6 +30,7 @@ from src.model_service import (
     evaluate_application,
     model_status,
 )
+from src.rag_service import retrieve_creditrisk_context, format_grounding_context
 
 # -----------------------------------------------------------------------------
 # 1. DATABASE CONNECTIVITY & SHARED STORAGE (100% BẢO TOÀN NGUYÊN BẢN)
@@ -72,7 +73,7 @@ def init_history_table():
 
 
 def save_history_item(item):
-    """Save one prediction to the shared PostgreSQL database."""
+    """Save a prediction and attach its database ID to the in-session result."""
     conn = db_connect()
     if conn is None:
         return False, "Chưa cấu hình DATABASE_URL trong Streamlit Secrets."
@@ -81,9 +82,13 @@ def save_history_item(item):
         with conn:
             with conn.cursor() as cur:
                 cur.execute(
-                    "INSERT INTO credit_risk_history (payload) VALUES (%s::jsonb)",
+                    "INSERT INTO credit_risk_history (payload) VALUES (%s::jsonb) RETURNING id, created_at",
                     (payload,),
                 )
+                row = cur.fetchone()
+        if row:
+            item["_history_id"] = int(row[0])
+            item["_db_created_at"] = row[1].isoformat() if hasattr(row[1], "isoformat") else str(row[1])
         return True, ""
     except Exception as exc:
         return False, str(exc)
@@ -92,23 +97,30 @@ def save_history_item(item):
 
 
 def load_history(limit=500):
-    """Return recent shared predictions, newest first."""
+    """Return recent predictions with stable database IDs for user lookup."""
     conn = db_connect()
     if conn is None:
         return None, "Chưa cấu hình DATABASE_URL trong Streamlit Secrets."
     try:
         with conn.cursor() as cur:
             cur.execute(
-                "SELECT payload FROM credit_risk_history ORDER BY created_at DESC, id DESC LIMIT %s",
+                "SELECT id, created_at, payload FROM credit_risk_history ORDER BY created_at DESC, id DESC LIMIT %s",
                 (limit,),
             )
             rows = cur.fetchall()
-        return [row[0] for row in rows], ""
+        items = []
+        for record_id, created_at, payload in rows:
+            if isinstance(payload, str):
+                payload = json.loads(payload)
+            payload = dict(payload or {})
+            payload["_history_id"] = int(record_id)
+            payload["_db_created_at"] = created_at.isoformat() if hasattr(created_at, "isoformat") else str(created_at)
+            items.append(payload)
+        return items, ""
     except Exception as exc:
         return None, str(exc)
     finally:
         conn.close()
-
 
 # -----------------------------------------------------------------------------
 # 2. GEMINI AI ASSISTANT MULTITURN ENGINE (100% BẢO TOÀN NGUYÊN BẢN)
@@ -170,7 +182,7 @@ NHIỆM VỤ CỐT LÕI:
 """
 
 
-def _build_chat_contents(question, current_result, conversation):
+def _build_chat_contents(question, current_result, conversation, retrieved_context=None):
     """Send a compact, structured multi-turn conversation instead of one giant prompt."""
     contents = []
     recent = conversation[-8:] if conversation else []
@@ -199,6 +211,8 @@ def _build_chat_contents(question, current_result, conversation):
         if isinstance(factors, list):
             context["factors"] = factors[:8]
 
+    if retrieved_context:
+        context["retrieved_evidence"] = format_grounding_context(retrieved_context)
     user_text = str(question).strip()
     if context:
         user_text = (
@@ -266,7 +280,18 @@ def stream_gemini_answer(question, current_result, conversation):
             "dự đoán này", "phân tích hồ sơ", "rủi ro cụ thể", "khuyến nghị",
         )
         thinking_level = "medium" if len(q) > 450 or any(marker in q for marker in complex_markers) else "low"
-        contents = _build_chat_contents(question, current_result, conversation)
+        retrieval = retrieve_creditrisk_context(
+            question=question,
+            current_result=current_result,
+            database_url=get_database_url(),
+            current_record_id=(current_result or {}).get("_history_id") if isinstance(current_result, dict) else None,
+        )
+        if retrieval and retrieval.get("status") in {"not_found", "clarify", "retrieval_error", "documents_pending"}:
+            yield retrieval.get("message", "Không có đủ dữ liệu truy xuất để trả lời chính xác.")
+            return
+        contents = _build_chat_contents(
+            question, current_result, conversation, retrieved_context=retrieval
+        )
         config = types.GenerateContentConfig(
             system_instruction=_GEMINI_SYSTEM_INSTRUCTION,
             max_output_tokens=1400,
@@ -1425,6 +1450,7 @@ elif page == "📋 Lịch sử thẩm định":
 
             row_data = {
                 "STT": i,
+                "Mã hồ sơ": item.get("_history_id", "N/A"),
                 "Thời gian": item.get("created_at", "N/A"),
                 "Tuổi": app.get("person_age"),
                 "Thu nhập": f"${app.get('person_income', 0):,.0f}",
